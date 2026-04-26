@@ -729,3 +729,66 @@ fn test_calculate_single_sided_deposit_split() {
     // s ≈ 500.62 for this depth. Integer floor is 500.
     assert_eq!(swap_amount, 500);
 }
+
+// ── Unit tests for calculate_volatility_fee_multiplier ───────────────────────
+
+/// Trade < 1% of reserve → standard multiplier (100 = 1.0×)
+#[test]
+fn test_volatility_multiplier_small_trade_returns_100() {
+    // trade_size = 0.5% of reserve → below 1% threshold
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(5, 1000);
+    assert_eq!(multiplier, 100);
+}
+
+/// Trade exactly at 1% boundary → standard multiplier (100 = 1.0×)
+#[test]
+fn test_volatility_multiplier_at_1_percent_returns_100() {
+    // trade_size = 1% of reserve (10 / 1000 = 1%)
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(10, 1000);
+    assert_eq!(multiplier, 100);
+}
+
+/// Trade between 1% and 5% → standard multiplier (100 = 1.0×)
+#[test]
+fn test_volatility_multiplier_medium_trade_returns_100() {
+    // trade_size = 3% of reserve (30 / 1000 = 3%)
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(30, 1000);
+    assert_eq!(multiplier, 100);
+}
+
+/// Trade exactly at 5% boundary → standard multiplier (100 = 1.0×)
+#[test]
+fn test_volatility_multiplier_at_5_percent_returns_100() {
+    // trade_size = 5% of reserve (50 / 1000 = 5%)
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(50, 1000);
+    assert_eq!(multiplier, 100);
+}
+
+/// Trade > 5% of reserve → high-volatility multiplier (150 = 1.5×)
+#[test]
+fn test_volatility_multiplier_large_trade_returns_150() {
+    // trade_size = 6% of reserve (60 / 1000 = 6%)
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(60, 1000);
+    assert_eq!(multiplier, 150);
+}
+
+/// Very large trade (50% of reserve) → high-volatility multiplier (150 = 1.5×)
+#[test]
+fn test_volatility_multiplier_very_large_trade_returns_150() {
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(500, 1000);
+    assert_eq!(multiplier, 150);
+}
+
+/// Zero trade size → standard multiplier (guard clause)
+#[test]
+fn test_volatility_multiplier_zero_trade_returns_100() {
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(0, 1000);
+    assert_eq!(multiplier, 100);
+}
+
+/// Zero reserve → standard multiplier (guard clause, avoids division by zero)
+#[test]
+fn test_volatility_multiplier_zero_reserve_returns_100() {
+    let multiplier = AmmPool::calculate_volatility_fee_multiplier(100, 0);
+    assert_eq!(multiplier, 100);
+}
