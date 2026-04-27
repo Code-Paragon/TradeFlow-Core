@@ -24,6 +24,7 @@ export default function HomePage() {
 
   const navigationItems = [
     { name: 'Dashboard', href: '/', icon: '🏠' },
+    { name: 'Submit Invoice', href: '/invoice', icon: '📝' },
     { name: 'Proofs', href: '/proofs', icon: '📄' },
     { name: 'Verify', href: '/verify', icon: '✅' },
     { name: 'Settings', href: '/settings', icon: '⚙️' },
@@ -147,8 +148,14 @@ export default function HomePage() {
             
             <div className="flex flex-col sm:flex-row gap-4 justify-center">
               <a
-                href="/verify"
+                href="/invoice"
                 className="btn btn-primary text-lg px-6 py-3"
+              >
+                Submit Invoice
+              </a>
+              <a
+                href="/verify"
+                className="btn btn-secondary text-lg px-6 py-3"
               >
                 Start Verification
               </a>
@@ -160,7 +167,7 @@ export default function HomePage() {
               </a>
               <button
                 onClick={() => setIsTokenModalOpen(true)}
-                className="btn btn-primary text-lg px-6 py-3"
+                className="btn btn-outline text-lg px-6 py-3"
               >
                 Import Token
               </button>

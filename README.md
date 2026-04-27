@@ -143,7 +143,89 @@ The following contracts are currently active for frontend integration and testin
 - **Network Passphrase:** `Test SDF Network ; September 2015`
 - **RPC Endpoint:** `https://soroban-testnet.stellar.org`
 
-## 🚀 Quick Start
+## � Stellar Asset Contract (SAC) Integration
+
+TradeFlow-Core now natively integrates with the official Stellar Asset Contract (SAC) for real-world token operations on Mainnet. All token interactions use `soroban_sdk::token::Client` for secure, standardized cross-contract calls.
+
+### SAC Client Usage
+
+All contracts create token clients to interact with SAC-compliant tokens:
+
+```rust
+use soroban_sdk::token;
+
+// Create a token client for any SAC-compliant token
+let token_client = token::Client::new(&env, &token_address);
+
+// Check balance
+let balance = token_client.balance(&user_address);
+
+// Check allowance
+let allowance = token_client.allowance(&user_address, &spender_address);
+
+// Transfer tokens
+token_client.transfer(&from, &to, &amount);
+
+// Approve spending
+token_client.approve(&owner, &spender, &amount, &expiration_ledger);
+```
+
+### Supported Token Operations
+
+| Operation | Function | Description |
+| :--- | :--- | :--- |
+| **Balance Check** | `balance(address)` | Query token balance for any address |
+| **Allowance Check** | `allowance(owner, spender)` | Check approved spending limit |
+| **Transfer** | `transfer(from, to, amount)` | Move tokens between addresses |
+| **Approve** | `approve(owner, spender, amount, expiry)` | Set spending allowance |
+| **Decimals** | `decimals()` | Get token decimal precision |
+
+### Adding New Assets to Protocol
+
+To add a new token asset to TradeFlow:
+
+1. **Deploy SAC-Compatible Token**: Ensure token follows Stellar Asset Contract interface
+2. **Get Token Address**: Obtain the contract address after deployment
+3. **Create Liquidity Pool**: Use Factory to create pool with existing token
+   ```rust
+   factory.create_pool(
+       new_token_address,
+       existing_token_address,
+       30  // 0.30% fee tier
+   );
+   ```
+4. **Provide Initial Liquidity**: Add tokens to enable trading
+   ```rust
+   pool.provide_liquidity(
+       user_address,
+       new_token_address,
+       existing_token_address,
+       amount_new_token,
+       amount_existing_token,
+       min_shares
+   );
+   ```
+
+### Mainnet Considerations
+
+- **Real Token Transfers**: All operations move actual tokens on Stellar ledger
+- **Gas Costs**: Each SAC operation consumes gas for cross-contract calls
+- **Security**: Built-in reentrancy protection and balance checks
+- **Precision**: Automatic decimal handling for different token precisions
+
+### Testing with Mock Tokens
+
+For local testing, contracts use `StellarAssetClient` for token minting:
+
+```rust
+// Test environment setup
+token::StellarAssetClient::new(&env, &token_address).mint(&user, &amount);
+token::Client::new(&env, &token_address).approve(&user, &contract, &amount, &expiry);
+```
+
+---
+
+## �🚀 Quick Start
 
 ### Prerequisites
 - Rust & Cargo (latest stable)

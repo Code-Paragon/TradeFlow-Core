@@ -20,6 +20,8 @@ pub enum DataKey {
     Pools, // Map of (TokenA, TokenB) -> Pool
     PoolWasmHash, // The Wasm hash of the Pool contract to deploy
     Admin, // The address of the factory admin
+    PendingAdmin, // The address of the proposed new admin (two-step transfer)
+    TotalPools, // The total number of pools deployed
 }
 
 #[contract]
@@ -44,6 +46,7 @@ impl FactoryContract {
         env.storage().instance().set(&DataKey::FeeTo, &fee_to);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::PoolWasmHash, &pool_wasm_hash);
+        env.storage().instance().set(&DataKey::TotalPools, &0u32);
     }
 
     /// Helper function to sort two token addresses, creating a canonical pair
@@ -151,6 +154,17 @@ impl FactoryContract {
         pools.set((token_0, token_1), pool);
         env.storage().instance().set(&DataKey::Pools, &pools);
 
+        // Increment total pools counter for UI metrics and pagination logic
+        let mut total_pools: u32 = env.storage().instance().get(&DataKey::TotalPools).unwrap_or(0);
+        total_pools += 1;
+        env.storage().instance().set(&DataKey::TotalPools, &total_pools);
+
+        // Emit PoolCreated event
+        env.events().publish(
+            (symbol_short!("PoolCreated"), token_a, token_b),
+            pool_address.clone()
+        );
+
         pool_address
     }
 
@@ -171,6 +185,49 @@ impl FactoryContract {
         env.events().publish(
             (symbol_short!("Admin"), symbol_short!("SetFeeTo")),
             (old_fee_to, fee_to)
+        );
+    }
+
+    /// Proposes a new admin address for a two-step ownership transfer.
+    /// Only the current admin can call this. The proposed address must then call
+    /// `accept_admin` to complete the transfer, preventing accidental key burns.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `new_admin` - The address being proposed as the new admin.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("Proposed")),
+            new_admin
+        );
+    }
+
+    /// Completes the two-step admin ownership transfer.
+    /// Must be called by the address previously set via `propose_admin`.
+    /// This confirms the new admin's key is accessible before relinquishing control.
+    ///
+    /// # Panics
+    /// If there is no pending admin proposal, or the caller is not the pending admin.
+    pub fn accept_admin(env: Env) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("No pending admin proposal");
+        pending_admin.require_auth();
+
+        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+
+        env.storage().instance().set(&DataKey::Admin, &pending_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        // Emit AdminTransferred event so indexers and frontends can track ownership changes
+        env.events().publish(
+            (symbol_short!("Admin"), Symbol::new(&env, "Transferred")),
+            (old_admin, pending_admin)
         );
     }
 
@@ -205,5 +262,11 @@ impl FactoryContract {
             (symbol_short!("Admin"), Symbol::new(&env, "PoolStatus"), token_a, token_b),
             pool.paused
         );
+    }
+
+    /// Returns the total number of pools created by the factory.
+    /// This is used for UI metrics and pagination logic.
+    pub fn get_all_pools_length(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::TotalPools).unwrap_or(0)
     }
 }

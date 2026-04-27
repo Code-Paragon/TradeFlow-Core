@@ -4,6 +4,28 @@ This document describes the events emitted by the TradeFlow-Core smart contracts
 
 ## Factory Contract Events
 
+### Pool Created
+
+Emitted when a new liquidity pool is successfully created and deployed. This is the primary event that off-chain indexers should monitor to discover new trading pairs.
+
+*   **Topics**:
+    1.  `"PoolCreated"` (Symbol)
+    2.  `token_a` (Address) - The first token of the pair (original order)
+    3.  `token_b` (Address) - The second token of the pair (original order)
+*   **Data**: `pool_address: Address` - The address of the newly deployed pool contract
+
+**Trigger Conditions**:
+- Two different token addresses are provided
+- Valid fee tier is specified (5, 30, or 100 basis points)
+- Pool does not already exist for the token pair
+- Factory contract is properly initialized
+
+**Impact**:
+- New trading market becomes available
+- Frontend can display the new pair to users
+- Analytics systems can start tracking the new pool
+- Liquidity providers can begin adding liquidity
+
 ### Admin Action: Set Fee Recipient
 
 Emitted when the admin updates the address that receives protocol fees.

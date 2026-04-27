@@ -99,3 +99,43 @@ fn test_pair_exists_on_uninitialized_factory() {
     // Factory not initialized - should return false (empty map)
     assert_eq!(client.pair_exists(&token_a, &token_b), false);
 }
+
+#[test]
+fn test_propose_and_accept_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register_contract(None, FactoryContract);
+    let client = FactoryContractClient::new(&env, &factory_id);
+
+    let admin = Address::generate(&env);
+    let fee_to = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[0; 32]);
+    client.initialize_factory(&admin, &fee_to, &wasm_hash);
+
+    let new_admin = Address::generate(&env);
+
+    // Current admin proposes a new admin
+    client.propose_admin(&new_admin);
+
+    // New admin accepts — ownership transfers
+    client.accept_admin();
+}
+
+#[test]
+fn test_accept_admin_panics_with_no_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register_contract(None, FactoryContract);
+    let client = FactoryContractClient::new(&env, &factory_id);
+
+    let admin = Address::generate(&env);
+    let fee_to = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[0; 32]);
+    client.initialize_factory(&admin, &fee_to, &wasm_hash);
+
+    // No proposal made — accept_admin must fail
+    let result = client.try_accept_admin();
+    assert!(result.is_err(), "accept_admin must fail when no proposal exists");
+}

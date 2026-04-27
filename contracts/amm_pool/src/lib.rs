@@ -117,6 +117,9 @@ impl AmmPool {
         user.require_auth();
         Self::require_not_frozen(&env, &user);
         let mut state: PoolState = env.storage().instance().get(&DataKey::State).expect("Not initialized");
+        if state.is_deprecated {
+            panic!("Pool is deprecated");
+        }
         if state.deposits_paused {
             panic!("deposits are paused");
         }
@@ -231,6 +234,22 @@ impl AmmPool {
         let mut state: PoolState = env.storage().instance().get(&DataKey::State).expect("Not initialized");
         state.withdrawals_paused = paused;
         env.storage().instance().set(&DataKey::State, &state);
+    }
+
+    /// Admin-only: Permanently deprecate the pool.
+    /// This is an irreversible one-way toggle.
+    /// Swaps and new liquidity provision are disabled, but withdrawals remain active.
+    pub fn set_deprecated(env: Env) {
+        Self::require_admin(&env);
+        let mut state: PoolState = env.storage().instance().get(&DataKey::State).expect("Not initialized");
+        state.is_deprecated = true;
+        env.storage().instance().set(&DataKey::State, &state);
+
+        // Emit event for transparency
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("Deprecat")),
+            env.current_contract_address()
+        );
     }
 
     /// Verify that `user` holds at least `required_amount` of `token` and has granted
@@ -432,7 +451,7 @@ impl AmmPool {
     pub fn swap(env: Env, user: Address, amount_in: i128, is_a_in: bool) -> i128 {
         user.require_auth();
         Self::require_not_frozen(&env, &user);
-        let mut state: PoolState = env.storage().instance().get(&DataKey::State).expect("Not initialized");
+
         if state.deposits_paused {
             panic!("deposits are paused");
         }
@@ -631,5 +650,47 @@ impl AmmPool {
             y = (x.saturating_add(div)) / 2;
         }
         x
+    }
+
+    /// Calculate a volatility fee multiplier based on the ratio of a trade size to the pool reserve.
+    ///
+    /// This protects Liquidity Providers (LPs) from impermanent loss during extreme market events.
+    /// Large trades relative to pool depth cause significant price impact and expose LPs to
+    /// arbitrage losses. By increasing the fee for large trades, the protocol compensates LPs
+    /// for the elevated risk they bear during high-volatility periods.
+    ///
+    /// # Multiplier Logic
+    /// The return value is scaled by 100 to avoid floating-point arithmetic on-chain:
+    /// - `100` represents a multiplier of 1.0 (standard fee, no adjustment)
+    /// - `150` represents a multiplier of 1.5 (50% fee increase for high-impact trades)
+    ///
+    /// # Thresholds
+    /// - `trade_size < 1% of pool_reserve`  → multiplier = 1.0 (return 100)
+    ///   Small trades have negligible price impact; standard fee applies.
+    /// - `trade_size > 5% of pool_reserve`  → multiplier = 1.5 (return 150)
+    ///   Large trades cause significant slippage and impermanent loss risk for LPs.
+    /// - `1% ≤ trade_size ≤ 5%`             → multiplier = 1.0 (return 100)
+    ///   Medium trades fall within the standard fee band.
+    ///
+    /// # Arguments
+    /// * `trade_size`   - The size of the incoming trade (in the input token's native units).
+    /// * `pool_reserve` - The current reserve of the input token in the pool.
+    ///
+    /// # Returns
+    /// A `u32` multiplier scaled by 100: either `100` (1.0×) or `150` (1.5×).
+    pub fn calculate_volatility_fee_multiplier(trade_size: i128, pool_reserve: i128) -> u32 {
+        // Guard: if reserve is zero or inputs are non-positive, return standard multiplier
+        if pool_reserve <= 0 || trade_size <= 0 {
+            return 100;
+        }
+
+        // Check if trade_size > 5% of pool_reserve
+        // Equivalent to: trade_size * 100 > pool_reserve * 5
+        // Using integer arithmetic to avoid division and floating-point
+        if trade_size.saturating_mul(100) > pool_reserve.saturating_mul(5) {
+            return 150; // 1.5× multiplier — high-volatility trade, protect LPs
+        }
+
+        100 // 1.0× multiplier — standard fee applies
     }
 }
