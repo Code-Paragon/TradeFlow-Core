@@ -1,5 +1,23 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, symbol_short};
+use soroban_sdk::{
+    contract,
+    contracterror,
+    contractimpl,
+    contracttype,
+    panic_with_error,
+    symbol_short,
+    token,
+    Address,
+    Env,
+    U256,
+};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    InvariantViolated = 1,
+}
 
 mod tests;
 
@@ -29,6 +47,7 @@ pub enum DataKey {
     State,
     Admin,
     FrozenAddress(Address),
+    PendingAdmin,
 }
 
 #[contract]
@@ -101,11 +120,25 @@ impl AmmPool {
         if state.deposits_paused {
             panic!("deposits are paused");
         }
+
+        let client_a = token::Client::new(&env, &state.token_a);
+        let client_b = token::Client::new(&env, &state.token_b);
+
         Self::verify_balance_and_allowance(&env, &state.token_a, &user, amount_a);
         Self::verify_balance_and_allowance(&env, &state.token_b, &user, amount_b);
+
+        client_a.transfer(&user, &env.current_contract_address(), &amount_a);
+        client_b.transfer(&user, &env.current_contract_address(), &amount_b);
+
         state.reserve_a = state.reserve_a.saturating_add(amount_a);
         state.reserve_b = state.reserve_b.saturating_add(amount_b);
         env.storage().instance().set(&DataKey::State, &state);
+
+        // Invariant check: ensure physical balances back internal reserves
+        if client_a.balance(&env.current_contract_address()) < state.reserve_a || 
+           client_b.balance(&env.current_contract_address()) < state.reserve_b {
+            panic_with_error!(&env, Error::InvariantViolated);
+        }
     }
 
     /// Helper function to check admin authorization
@@ -148,6 +181,36 @@ impl AmmPool {
     /// Query function to check if an address is currently frozen
     pub fn is_frozen(env: Env, address: Address) -> bool {
         Self::is_address_frozen(&env, &address)
+    }
+
+    /// Step 1 of ownership transfer: Current admin proposes a new admin address.
+    /// Only the current admin can call this.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+    }
+
+    /// Step 2 of ownership transfer: The proposed admin accepts the role.
+    /// Only the pending admin can call this.
+    pub fn accept_admin(env: Env) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("No pending admin");
+        
+        pending_admin.require_auth();
+
+        let old_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        
+        env.storage().instance().set(&DataKey::Admin, &pending_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        // Emit event for transparency
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("Transfer")),
+            (old_admin, pending_admin)
+        );
     }
 
     /// Admin: pause or unpause new deposits and swaps into the pool.
@@ -290,10 +353,9 @@ impl AmmPool {
 
         let output_scaled = numerator / denominator;
 
-        // Scale back to target token's native decimals with round half-up
-        // output_native = (output_scaled + (scale_out / 2)) / scale_out
-        let half_scale_out = scale_out / 2;
-        let output_native = output_scaled.saturating_add(half_scale_out) / scale_out;
+        // Scale back to target token's native decimals.
+        // We MUST round down (truncate) to ensure the pool never gives out more than the formula allows.
+        let output_native = output_scaled / scale_out;
 
         // Return zero if the scaled output is below the target token's smallest unit
         if output_native == 0 {
@@ -368,14 +430,76 @@ impl AmmPool {
     /// # Returns
     /// The calculated amount of the output token based on the constant-product formula.
     pub fn swap(env: Env, user: Address, amount_in: i128, is_a_in: bool) -> i128 {
+        user.require_auth();
         Self::require_not_frozen(&env, &user);
-        let state: PoolState = env.storage().instance().get(&DataKey::State).expect("Not initialized");
+        let mut state: PoolState = env.storage().instance().get(&DataKey::State).expect("Not initialized");
         if state.deposits_paused {
             panic!("deposits are paused");
         }
-        let input_token = if is_a_in { &state.token_a } else { &state.token_b };
-        Self::verify_balance_and_allowance(&env, input_token, &user, amount_in);
-        Self::calculate_amount_out(env, amount_in, is_a_in)
+
+        let client_a = token::Client::new(&env, &state.token_a);
+        let client_b = token::Client::new(&env, &state.token_b);
+
+        // 1. Capture physical balances before any transfers occur
+        let bal_a_before = client_a.balance(&env.current_contract_address());
+        let bal_b_before = client_b.balance(&env.current_contract_address());
+
+        let token_in = if is_a_in { &state.token_a } else { &state.token_b };
+
+        // 2. Execute internal math and cross-contract token transfers
+        Self::verify_balance_and_allowance(&env, token_in, &user, amount_in);
+        let amount_out = Self::calculate_amount_out(env.clone(), amount_in, is_a_in);
+
+        if amount_out <= 0 {
+            panic!("insufficient output amount");
+        }
+
+        let client_in = if is_a_in { &client_a } else { &client_b };
+        let client_out = if is_a_in { &client_b } else { &client_a };
+
+        client_in.transfer(&user, &env.current_contract_address(), &amount_in);
+        client_out.transfer(&env.current_contract_address(), &user, &amount_out);
+
+        // Update reserves to reflect actual transfers
+        if is_a_in {
+            state.reserve_a = state.reserve_a.saturating_add(amount_in);
+            state.reserve_b = state.reserve_b.saturating_sub(amount_out);
+        } else {
+            state.reserve_b = state.reserve_b.saturating_add(amount_in);
+            state.reserve_a = state.reserve_a.saturating_sub(amount_out);
+        }
+        env.storage().instance().set(&DataKey::State, &state);
+
+        // 3. Capture physical balances again after transfers
+        let bal_a_after = client_a.balance(&env.current_contract_address());
+        let bal_b_after = client_b.balance(&env.current_contract_address());
+
+        // 4. Assert that the new balance matches the mathematical expectation (Invariant Verification)
+        // We scale to 18 decimals to ensure precision parity during the multiplication check.
+        let scale_a = 10i128.pow(18 - state.token_a_decimals);
+        let scale_b = 10i128.pow(18 - state.token_b_decimals);
+
+        let a_old = bal_a_before.saturating_mul(scale_a);
+        let b_old = bal_b_before.saturating_mul(scale_b);
+        let a_new = bal_a_after.saturating_mul(scale_a);
+        let b_new = bal_b_after.saturating_mul(scale_b);
+
+        // Use U256 to prevent i128 saturation on deep liquidity pools (10^18 * 10^18 = 10^36)
+        let k_before = U256::from_i128(&env, a_old).mul(&U256::from_i128(&env, b_old));
+        let k_after = U256::from_i128(&env, a_new).mul(&U256::from_i128(&env, b_new));
+
+        // The constant product K must never decrease (it should increase by the collected fee).
+        // We use compare because U256 doesn't support standard comparison operators directly in all SDK versions
+        if k_after < k_before {
+            panic_with_error!(&env, Error::InvariantViolated);
+        }
+
+        // Final safety check: internal reserves MUST be physically covered by contract balances.
+        if bal_a_after < state.reserve_a || bal_b_after < state.reserve_b {
+            panic_with_error!(&env, Error::InvariantViolated);
+        }
+
+        amount_out
     }
 
     /// Remove liquidity from the pool, returning underlying tokens to the user.
@@ -395,9 +519,22 @@ impl AmmPool {
         if state.reserve_a < amount_a || state.reserve_b < amount_b {
             panic!("insufficient reserves");
         }
-        state.reserve_a -= amount_a;
-        state.reserve_b -= amount_b;
+
+        let client_a = token::Client::new(&env, &state.token_a);
+        let client_b = token::Client::new(&env, &state.token_b);
+
+        client_a.transfer(&env.current_contract_address(), &user, &amount_a);
+        client_b.transfer(&env.current_contract_address(), &user, &amount_b);
+
+        state.reserve_a = state.reserve_a.saturating_sub(amount_a);
+        state.reserve_b = state.reserve_b.saturating_sub(amount_b);
         env.storage().instance().set(&DataKey::State, &state);
+
+        // Invariant check: physical balances must back internal reserves
+        if client_a.balance(&env.current_contract_address()) < state.reserve_a || 
+           client_b.balance(&env.current_contract_address()) < state.reserve_b {
+            panic_with_error!(&env, Error::InvariantViolated);
+        }
     }
 
     /// Read the current pool reserve ratio (reserve_a / reserve_b) scaled by 10^7.
