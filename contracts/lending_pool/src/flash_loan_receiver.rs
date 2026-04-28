@@ -6,7 +6,7 @@
 /// - Revert/panic if unable to repay.
 /// - No return value expected (void function).
 
-use soroban_sdk::{Env, Bytes, i128};
+use soroban_sdk::{Env, Bytes};
 
 #[soroban_sdk::contracttrait]
 pub trait FlashLoanReceiver {

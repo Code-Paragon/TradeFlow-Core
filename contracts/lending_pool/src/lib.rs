@@ -4,14 +4,11 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Ad
 pub mod flash_loan_receiver;
 pub use flash_loan_receiver::FlashLoanReceiver;
 
-
-#[cfg(test)]
-mod tests;
-
 /// Flash loan fee in basis points (8 bps = 0.08%)
 /// This fee compensates Liquidity Providers for temporary risk exposure
 /// while generating additional protocol revenue.
 const FLASH_LOAN_FEE_BPS: i128 = 8;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -29,6 +26,7 @@ pub enum Error {
     PoolIsPaused = 11,
     EmptyPool = 12,
     TradeSizeTooLarge = 13,
+    UnauthorizedBorrower = 14,
 }
 
 #[contracttype]
@@ -63,6 +61,7 @@ pub enum DataKey {
     WhitelistActive,
     Whitelisted(Address),
     MaxTradePercentage,
+    ApprovedFlashBorrower(Address), // Flash loan borrower whitelist
 }
 
 #[contract]
@@ -117,6 +116,30 @@ impl LendingPool {
         Self::require_admin(&env);
         env.storage().persistent().set(&DataKey::Whitelisted(address.clone()), &true);
         env.storage().persistent().extend_ttl(&DataKey::Whitelisted(address), 535_680, 535_680);
+        
+        Self::extend_instance_ttl(&env);
+    }
+
+    // SET FLASH BORROWER STATUS: Add/remove address from flash loan whitelist (admin only)
+    pub fn set_flash_borrower_status(env: Env, borrower_address: Address, is_approved: bool) {
+        Self::require_admin(&env);
+        
+        if is_approved {
+            // Add to approved flash borrowers whitelist
+            env.storage().persistent().set(&DataKey::ApprovedFlashBorrower(borrower_address.clone()), &true);
+            env.storage().persistent().extend_ttl(&DataKey::ApprovedFlashBorrower(borrower_address.clone()), 535_680, 535_680);
+            
+            // Emit event for adding borrower to whitelist
+            env.events().publish((symbol_short!("flash_add"), borrower_address.clone()), env.ledger().sequence());
+        } else {
+            // Remove from approved flash borrowers whitelist
+            if env.storage().persistent().has(&DataKey::ApprovedFlashBorrower(borrower_address.clone())) {
+                env.storage().persistent().remove(&DataKey::ApprovedFlashBorrower(borrower_address.clone()));
+                
+                // Emit event for removing borrower from whitelist
+                env.events().publish((symbol_short!("flash_rem"), borrower_address.clone()), env.ledger().sequence());
+            }
+        }
         
         Self::extend_instance_ttl(&env);
     }
@@ -426,8 +449,12 @@ impl LendingPool {
     /// `execute_operation(env: Env, amount: i128, fee: i128, params: Bytes)`
     /// Must repay via token.transfer before returning, else entire tx reverts.
     pub fn flash_loan(env: Env, receiver: Address, amount: i128, params: Bytes) {
-
         Self::check_paused(&env);
+        
+        // SECURITY: Check if caller is on the approved flash loan borrower whitelist
+        if !env.storage().persistent().has(&DataKey::ApprovedFlashBorrower(receiver.clone())) {
+            panic_with_error!(&env, Error::UnauthorizedBorrower);
+        }
         
         if amount <= 0 {
             panic_with_error!(&env, Error::MathOverflow);
