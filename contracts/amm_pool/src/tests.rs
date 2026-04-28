@@ -19,12 +19,12 @@ impl MockToken {
         env.storage().instance().set(&symbol_short!("dec"), &decimals);
     }
 
-    pub fn balance(env: Env, _id: Address) -> i128 {
-        env.storage().instance().get(&symbol_short!("bal")).unwrap_or(i128::MAX)
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage().persistent().get(&id).unwrap_or(i128::MAX)
     }
 
-    pub fn set_balance(env: Env, bal: i128) {
-        env.storage().instance().set(&symbol_short!("bal"), &bal);
+    pub fn set_balance(env: Env, id: Address, bal: i128) {
+        env.storage().persistent().set(&id, &bal);
     }
 
     pub fn allowance(env: Env, _from: Address, _spender: Address) -> i128 {
@@ -33,6 +33,13 @@ impl MockToken {
 
     pub fn set_allowance(env: Env, alw: i128) {
         env.storage().instance().set(&symbol_short!("alw"), &alw);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let mut b_from = Self::balance(env.clone(), from.clone());
+        let mut b_to = Self::balance(env.clone(), to.clone());
+        if b_from != i128::MAX { b_from -= amount; env.storage().persistent().set(&from, &b_from); }
+        if b_to != i128::MAX { b_to += amount; env.storage().persistent().set(&to, &b_to); }
     }
 }
 
@@ -238,7 +245,8 @@ fn setup_pool_with_balances(
     let token_b_id = env.register_contract(None, MockToken);
     let token_client = MockTokenClient::new(env, &token_id);
     token_client.set_decimals(&18u32);
-    token_client.set_balance(&balance);
+    let user = Address::generate(env);
+    token_client.set_balance(&user, &balance);
     token_client.set_allowance(&allowance);
     let token_b_client = MockTokenClient::new(env, &token_b_id);
     token_b_client.set_decimals(&18u32);
@@ -247,8 +255,6 @@ fn setup_pool_with_balances(
     let pool = AmmPoolClient::new(env, &pool_id);
     let admin = Address::generate(env);
     pool.init(&admin, &token_id, &token_b_id, &30u32);
-
-    let user = Address::generate(env);
     (pool, token_id, user)
 }
 
@@ -303,15 +309,15 @@ use proptest::prelude::*;
 fn pool_with(env: &Env, balance: i128, allowance: i128) -> (AmmPoolClient, Address) {
     let token_a = env.register_contract(None, MockToken);
     let token_b = env.register_contract(None, MockToken);
+    let user = Address::generate(env);
     MockTokenClient::new(env, &token_a).set_decimals(&18u32);
-    MockTokenClient::new(env, &token_a).set_balance(&balance);
+    MockTokenClient::new(env, &token_a).set_balance(&user, &balance);
     MockTokenClient::new(env, &token_a).set_allowance(&allowance);
     MockTokenClient::new(env, &token_b).set_decimals(&18u32);
     let pool_id = env.register_contract(None, AmmPool);
     let pool = AmmPoolClient::new(env, &pool_id);
     let admin = Address::generate(env);
     pool.init(&admin, &token_a, &token_b, &30u32);
-    let user = Address::generate(env);
     (pool, user)
 }
 
@@ -366,6 +372,55 @@ fn test_provide_liquidity_calls_helper() {
     pool.provide_liquidity(&user, &1_000i128, &1_000i128);
 }
 
+#[test]
+fn test_swap_invariant_verification() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (pool_id, token_a_id, token_b_id) = create_pool_with_tokens(&env, 18, 18);
+    let pool = AmmPoolClient::new(&env, &pool_id);
+    let user = Address::generate(&env);
+    
+    MockTokenClient::new(&env, &token_a_id).set_balance(&user, &2000);
+    MockTokenClient::new(&env, &token_b_id).set_balance(&user, &2000);
+
+    pool.provide_liquidity(&user, &1000, &1000);
+    
+    // Perform a normal swap. The invariant check inside swap() must pass.
+    let amount_out = pool.swap(&user, &100, &true);
+    assert!(amount_out > 0);
+    
+    // Verify spot price changed correctly
+    let price = pool.get_spot_price();
+    assert!(price > 10_000_000);
+}
+
+#[test]
+fn test_swap_invariant_violation_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (pool_id, token_a_id, token_b_id) = create_pool_with_tokens(&env, 18, 18);
+    let pool = AmmPoolClient::new(&env, &pool_id);
+    let user = Address::generate(&env);
+    
+    // Set specific balances instead of i128::MAX to enable physical tracking
+    MockTokenClient::new(&env, &token_a_id).set_balance(&user, &2000);
+    MockTokenClient::new(&env, &token_b_id).set_balance(&user, &2000);
+    MockTokenClient::new(&env, &token_a_id).set_balance(&pool_id, &0);
+    MockTokenClient::new(&env, &token_b_id).set_balance(&pool_id, &0);
+
+    pool.provide_liquidity(&user, &1000, &1000);
+    
+    // Manually corrupt the pool's physical balance (e.g. simulate a drain/exploit)
+    // This should cause the swap to fail the invariant check at the end.
+    MockTokenClient::new(&env, &token_a_id).set_balance(&pool_id, &100); 
+
+    let result = pool.try_swap(&user, &100, &true);
+    match result {
+        Err(Ok(Error::InvariantViolated)) => (),
+        _ => panic!("Expected InvariantViolated error, got {:?}", result),
+    }
+}
+
 /// swap succeeds when user has sufficient balance and allowance for the input token.
 #[test]
 fn test_swap_calls_helper() {
@@ -373,8 +428,9 @@ fn test_swap_calls_helper() {
     env.mock_all_auths();
     let token_a = env.register_contract(None, MockToken);
     let token_b = env.register_contract(None, MockToken);
+    let user = Address::generate(&env);
     MockTokenClient::new(&env, &token_a).set_decimals(&18u32);
-    MockTokenClient::new(&env, &token_a).set_balance(&i128::MAX);
+    MockTokenClient::new(&env, &token_a).set_balance(&user, &i128::MAX);
     MockTokenClient::new(&env, &token_a).set_allowance(&i128::MAX);
     MockTokenClient::new(&env, &token_b).set_decimals(&18u32);
 
@@ -388,7 +444,6 @@ fn test_swap_calls_helper() {
     pool.provide_liquidity(&lp, &1_000i128, &1_000i128);
 
     // Swap with a user who has sufficient balance and allowance
-    let user = Address::generate(&env);
     let out = pool.swap(&user, &100i128, &true);
     assert!(out > 0, "expected positive output from swap");
 }
@@ -705,6 +760,40 @@ fn test_freeze_is_address_specific() {
     // Only addr1 should be frozen
     assert!(pool.is_frozen(&addr1));
     assert!(!pool.is_frozen(&addr2));
+}
+
+#[test]
+fn test_admin_ownership_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (pool, admin) = create_pool_with_admin(&env);
+    let new_admin = Address::generate(&env);
+
+    // Step 1: Propose new admin
+    pool.propose_admin(&new_admin);
+
+    // Step 2: New admin accepts the role
+    pool.accept_admin();
+
+    // Verify events
+    let events = env.events().all();
+    let last_event = events.last().expect("Expected transfer event");
+    
+    assert_eq!(last_event.0, pool.address);
+    assert_eq!(last_event.1, (symbol_short!("Admin"), symbol_short!("Transfer")).into_val(&env));
+    assert_eq!(last_event.2, (admin, new_admin).into_val(&env));
+}
+
+#[test]
+fn test_accept_admin_fails_without_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (pool, _admin) = create_pool_with_admin(&env);
+    
+    // Try to accept without a pending proposal
+    // In Soroban tests, try_ methods catch panics
+    let result = pool.try_accept_admin();
+    assert!(result.is_err());
 }
 
 #[test]
